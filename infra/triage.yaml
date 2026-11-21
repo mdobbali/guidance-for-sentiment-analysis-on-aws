@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  triage - complaint and adverse-event triage. Private Aurora PostgreSQL Serverless v2
+  (pgvector), an SSM-only access host (no inbound ports), an S3 Object Lock audit bucket,
+  and a least-privilege IAM policy for the app. Derived from AWS Guidance SO9449.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: triage-dev
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: Prefix for resource names. Lets several stacks share an account.
+  VpcCidr:
+    Type: String
+    Default: 10.215.0.0/16
+  DBEngineVersion:
+    Type: String
+    Default: ""
+    Description: Aurora PostgreSQL version (for example 16.8). Empty uses the current AWS default.
+  MinCapacity:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 0.5, 1, 2]
+    Description: Serverless v2 minimum ACUs. 0 lets the cluster pause when idle (dev); use 0.5+ for prod.
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 128
+  DeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  CreateAccessHost:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: A t4g.nano reachable only through SSM Session Manager, for port forwarding to the DB.
+  AuditRetentionMode:
+    Type: String
+    Default: GOVERNANCE
+    AllowedValues: [GOVERNANCE, COMPLIANCE]
+    Description: >-
+      COMPLIANCE means nobody, including the root user, can delete audit records before they
+      expire. Use it for production; GOVERNANCE lets authorised admins clean up dev stacks.
+  AuditRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Default Object Lock retention. Match it to your records retention policy in production.
+  BedrockModelPattern:
+    Type: String
+    Default: "anthropic.claude-*"
+    Description: Claude models the app may invoke (Bedrock model id pattern).
+
+Conditions:
+  HasEngineVersion: !Not [!Equals [!Ref DBEngineVersion, ""]]
+  WithAccessHost: !Equals [!Ref CreateAccessHost, "true"]
+  AutoPause: !Equals [!Ref MinCapacity, 0]
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Ref EnvName}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Ref EnvName}]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet: only the access host lives here, and it has no inbound rules.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 8, 8]]
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-public-a"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-public"}]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  # Isolated subnets for the database: no route to the internet at all.
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 8, 8]]
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-db-a"}]
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 8, 8]]
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-db-b"}]
+
+  IsolatedRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-isolated"}]
+
+  DbSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DbSubnetA
+      RouteTableId: !Ref IsolatedRouteTable
+
+  DbSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DbSubnetB
+      RouteTableId: !Ref IsolatedRouteTable
+
+  # ---------------------------------------------------------------- encryption
+  Key:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${EnvName} database, secret and audit encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Standard key policy: delegate access control to IAM policies in this account
+          # (the app policy below grants only what it needs).
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+            Action: "kms:*"
+            Resource: "*"
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${EnvName}"
+      TargetKeyId: !Ref Key
+
+  # ---------------------------------------------------------------- database
+  AccessHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvName} access host - no inbound; SSM over HTTPS out"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: SSM and package repos}
+
+  AccessHostToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AccessHostSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL to the cluster
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvName} Aurora - inbound only from app and access host groups"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 127.0.0.1/32, Description: No egress}
+
+  DbIngressFromAccessHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AccessHostSecurityGroup
+
+  # Attach this group to the app's compute (ECS task, Lambda, EC2) when you deploy it in the VPC.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvName} application"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: AWS APIs}
+
+  AppToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  DbIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${EnvName} isolated subnets"
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${EnvName}-pg"
+      Engine: aurora-postgresql
+      EngineVersion: !If [HasEngineVersion, !Ref DBEngineVersion, !Ref AWS::NoValue]
+      DatabaseName: triage
+      MasterUsername: triage_admin
+      # RDS creates, encrypts and rotates the master password in Secrets Manager.
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !Ref Key
+      EnableIAMDatabaseAuthentication: true
+      StorageEncrypted: true
+      KmsKeyId: !Ref Key
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DeletionProtection
+      EnableCloudwatchLogsExports: [postgresql]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        SecondsUntilAutoPause: !If [AutoPause, 1800, !Ref AWS::NoValue]
+      Tags: [{Key: Name, Value: !Ref EnvName}]
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceIdentifier: !Sub "${EnvName}-pg-1"
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref Key
+      PerformanceInsightsRetentionPeriod: 7
+
+  # ---------------------------------------------------------------- audit trail (WORM)
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: !Ref AuditRetentionMode
+            Days: !Ref AuditRetentionDays
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref Key
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-audit"}]
+
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AuditBucket.Arn, !Sub "${AuditBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  # ---------------------------------------------------------------- app permissions
+  # Attach to the role the app runs as (your SSO role for local use, or an ECS task role).
+  AppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${EnvName}-app"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeModels
+            Effect: Allow
+            Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockModelPattern}"
+              - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*${BedrockModelPattern}"
+          - Sid: RedactPhi
+            Effect: Allow
+            Action: comprehendmedical:DetectPHI
+            Resource: "*"
+          - Sid: ReadDbSecret
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+          - Sid: WriteAuditRecords
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${AuditBucket.Arn}/audit/*"
+          - Sid: UseKey
+            Effect: Allow
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: !GetAtt Key.Arn
+
+  # ---------------------------------------------------------------- access host (SSM only)
+  AccessHostRole:
+    Type: AWS::IAM::Role
+    Condition: WithAccessHost
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  AccessHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: WithAccessHost
+    Properties:
+      Roles: [!Ref AccessHostRole]
+
+  AccessHost:
+    Type: AWS::EC2::Instance
+    Condition: WithAccessHost
+    Properties:
+      InstanceType: t4g.nano
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+      IamInstanceProfile: !Ref AccessHostProfile
+      MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled}
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref PublicSubnetA
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref AccessHostSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 8, VolumeType: gp3, Encrypted: true, KmsKeyId: !Ref Key}
+      Tags: [{Key: Name, Value: !Sub "${EnvName}-access"}]
+
+Outputs:
+  DBEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+  DBName:
+    Value: triage
+  DBSecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  AuditBucket:
+    Value: !Ref AuditBucket
+  AppPolicyArn:
+    Value: !Ref AppPolicy
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+  AccessHostId:
+    Condition: WithAccessHost
+    Value: !Ref AccessHost
+  PortForwardCommand:
+    Condition: WithAccessHost
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${AccessHost}
+      --document-name AWS-StartPortForwardingSessionToRemoteHost
+      --parameters host=${DbCluster.Endpoint.Address},portNumber=5432,localPortNumber=5432
